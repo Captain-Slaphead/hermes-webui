@@ -13072,11 +13072,22 @@ let _cronUnreadCount=0;
 let _cronPollGeneration=0;
 const _cronNewJobIds=new Set();  // track which job IDs had new completions (unread)
 // Completions whose bounded session lookup failed, remembered on the page so the
-// poll cursor can advance instead of replaying them. Bounded: at most
-// _CRON_PENDING_MAX entries, each retried at most _CRON_PENDING_ATTEMPTS times.
-const _CRON_PENDING_MAX=50;
-const _CRON_PENDING_ATTEMPTS=5;
-const _cronPendingDetails=new Map();  // `${job_id}:${completed_at}` -> {job_id, completed_at, attempts}
+// poll cursor can advance instead of replaying them. The map is unbounded: every
+// unresolved completion is kept, because the cursor has moved past it and an
+// eviction would lose its unread marker for good. Each retry request covers at
+// most _CRON_RETRY_BATCH entries, and a still-failing entry backs off rather than
+// being dropped outright.
+const _CRON_RETRY_BATCH=50;
+const _CRON_PENDING_BACKOFF_BASE_MS=30000;
+const _CRON_PENDING_BACKOFF_MAX_MS=1800000;
+const _cronPendingDetails=new Map();  // `${job_id}:${completed_at}` -> {job_id, completed_at, attempts, next_at}
+
+// Next retry delay for a still-failing completion: 30 s, doubling, capped at
+// 30 minutes. The entry is never discarded, so a slow lookup cannot lose a marker.
+function _cronPendingBackoffMs(attempts){
+  const n=Math.max(1,Number(attempts)||1);
+  return Math.min(_CRON_PENDING_BACKOFF_BASE_MS*Math.pow(2,n-1),_CRON_PENDING_BACKOFF_MAX_MS);
+}
 
 function _resetCronUnreadForProfileSwitch(){
   _cronPollGeneration++;
@@ -13109,22 +13120,29 @@ function _cronRememberPendingDetails(completions){
       job_id:c.job_id,
       completed_at:c.completed_at,
       attempts:prev?prev.attempts:0,
+      next_at:prev?prev.next_at:0,
     });
-  }
-  while(_cronPendingDetails.size>_CRON_PENDING_MAX){
-    _cronPendingDetails.delete(_cronPendingDetails.keys().next().value);
   }
 }
 
 // Re-fetch the detail for completions whose bounded lookup failed, in a separate
 // narrow request over the window that holds them. The cursor has already moved
-// past them, so this is the only place they are revisited; after
-// _CRON_PENDING_ATTEMPTS the page gives up, so a permanently failing lookup
-// cannot replay a completion (or its badge and toast) forever.
+// past them, so this is the only place they are revisited. Each call retries the
+// oldest due entries up to _CRON_RETRY_BATCH; a still-failing entry backs off
+// (grows its next_at) instead of being dropped, so a permanently slow lookup
+// cannot lose a completion's marker.
 async function _cronRetryPendingDetails(pollGeneration){
   if(!_cronPendingDetails.size) return;
-  let since=Infinity;
+  const now=Date.now();
+  const due=[];
   for(const entry of _cronPendingDetails.values()){
+    if((Number(entry.next_at)||0)<=now) due.push(entry);
+  }
+  if(!due.length) return;
+  due.sort((a,b)=>(Number(a.completed_at)||0)-(Number(b.completed_at)||0));
+  const batch=due.slice(0,_CRON_RETRY_BATCH);
+  let since=Infinity;
+  for(const entry of batch){
     since=Math.min(since,Number(entry.completed_at)||0);
   }
   let data={};
@@ -13134,6 +13152,7 @@ async function _cronRetryPendingDetails(pollGeneration){
     data={};
   }
   if(pollGeneration!==_cronPollGeneration) return;
+  const finishedAt=Date.now();
   const resolved=new Set();
   for(const c of (data.completions||[])){
     const key=`${c.job_id}:${c.completed_at}`;
@@ -13147,10 +13166,14 @@ async function _cronRetryPendingDetails(pollGeneration){
       });
     }
   }
-  for(const [key,entry] of Array.from(_cronPendingDetails)){
-    if(resolved.has(key)){ _cronPendingDetails.delete(key); continue; }
+  for(const key of resolved){
+    _cronPendingDetails.delete(key);
+  }
+  for(const entry of batch){
+    const key=`${entry.job_id}:${entry.completed_at}`;
+    if(!_cronPendingDetails.has(key)) continue;  // resolved this round
     entry.attempts=Number(entry.attempts||0)+1;
-    if(entry.attempts>=_CRON_PENDING_ATTEMPTS) _cronPendingDetails.delete(key);
+    entry.next_at=finishedAt+_cronPendingBackoffMs(entry.attempts);
   }
 }
 

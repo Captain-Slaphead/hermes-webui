@@ -313,8 +313,8 @@ def _latest_cron_session_info_for_jobs(
     """Return newest persisted cron session info keyed by completed cron job id.
 
     Pure read of the agent ``state.db``. When ``deadline_s`` is supplied the
-    connection carries a wall-clock deadline and the scan carries a row cap, and
-    a bounded failure re-raises instead of degrading to an empty result so the
+    connection carries a wall-clock deadline that bounds the whole scan, and a
+    bounded failure re-raises instead of degrading to an empty result so the
     caller can report ``session_lookup_failed`` and retry. Without it the call
     keeps its original best-effort shape and returns empty info on error.
     """
@@ -327,11 +327,26 @@ def _latest_cron_session_info_for_jobs(
     db_path = _active_state_db_path()
     if not db_path or not Path(db_path).exists():
         return {jid: {"session_id": "", "message_count": None} for jid in requested}
-    # Hard row cap. The scan is ordered newest-first and we need at most one row
-    # per requested job, so the cap only ever bites on a pathologically long
-    # cron history; anything it does drop is re-fetched by the caller's bounded
-    # retry rather than silently mis-reported.
-    row_cap = max(200, 8 * max(1, len(requested)))
+    # No global row cap. A LIMIT over all cron sessions can exclude a requested
+    # job whose session sits behind newer rows from OTHER jobs, and the caller
+    # would then report that omission as a successful empty result.
+    #
+    # Restrict the read to the requested job ids up front: the previous shape
+    # scanned and sorted every cron session before filtering, and on a large
+    # state.db that pushed the read past its deadline, so after a few failed
+    # attempts the page dropped the completion's unread marker for good. The id
+    # restriction is an index range, so the read stays inside the budget whatever
+    # the number of other jobs' sessions. The wall-clock deadline below remains
+    # the backstop: a read that still outruns it aborts and re-raises, so the
+    # caller reports session_lookup_failed and the page retries.
+    bounds = []
+    for jid in requested:
+        lo = f"cron_{jid}_"
+        bounds.append((lo, lo + chr(0x10FFFF)))
+    id_clause = (
+        "(" + " OR ".join("(s.id >= ? AND s.id < ?)" for _ in bounds) + ")"
+    )
+    id_params = [v for lo, hi in bounds for v in (lo, hi)]
     try:
         if deadline_s is None:
             conn = open_state_db_readonly(db_path)
@@ -357,8 +372,8 @@ def _latest_cron_session_info_for_jobs(
                            {select_message_count}
                     FROM sessions s
                     WHERE LOWER(COALESCE(s.source, '')) = 'cron'
+                      AND {id_clause}
                     ORDER BY COALESCE(s.started_at, 0) DESC, s.id DESC  -- newest start, not last activity
-                    LIMIT {row_cap}
                 """
             else:
                 query = f"""
@@ -366,10 +381,10 @@ def _latest_cron_session_info_for_jobs(
                            {select_message_count}
                     FROM sessions s
                     WHERE LOWER(COALESCE(s.source, '')) = 'cron'
+                      AND {id_clause}
                     ORDER BY s.id DESC
-                    LIMIT {row_cap}
                 """
-            cur.execute(query)
+            cur.execute(query, id_params)
             results = {
                 jid: {"session_id": "", "message_count": None} for jid in requested
             }

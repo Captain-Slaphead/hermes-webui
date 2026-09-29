@@ -265,8 +265,14 @@ def test_lookup_deadline_does_not_trip_a_fast_read(tmp_path):
         assert conn.execute("SELECT count(*) FROM sessions").fetchone()[0] == 0
 
 
-def test_lookup_scan_is_row_capped(tmp_path, monkeypatch):
-    """The scan carries a row cap, so a long cron history cannot be read whole."""
+def test_lookup_finds_target_behind_newer_rows_from_other_jobs(tmp_path, monkeypatch):
+    """A requested job's session is found even behind 200+ newer rows of others (#7830).
+
+    The previous head applied a global ``LIMIT`` over all cron rows before
+    matching the requested jobs, so a target sitting behind more than the window
+    came back empty while the lookup reported success - a permanently lost unread
+    marker. The candidate window must not be capped globally.
+    """
     import api.profiles as profiles
     import api.routes as routes
 
@@ -278,10 +284,13 @@ def test_lookup_scan_is_row_capped(tmp_path, monkeypatch):
             "CREATE TABLE sessions ("
             "id TEXT PRIMARY KEY, source TEXT, started_at REAL, message_count INTEGER);"
         )
+        # 5000 newer sessions belonging to a DIFFERENT job ...
         conn.executemany(
             "INSERT INTO sessions VALUES (?, 'cron', ?, 1)",
-            [(f"cron_a_{i:06d}", float(i)) for i in range(5000)],
+            [(f"cron_b_{i:06d}", float(1000 + i)) for i in range(5000)],
         )
+        # ... and one older session for the requested job.
+        conn.execute("INSERT INTO sessions VALUES ('cron_a_000001', 'cron', 1.0, 7)")
 
     monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", home)
     monkeypatch.setattr(profiles, "_INITIAL_HERMES_HOME", home)
@@ -296,13 +305,127 @@ def test_lookup_scan_is_row_capped(tmp_path, monkeypatch):
 
     monkeypatch.setattr(routes, "open_state_db_readonly", _recording_open)
 
-    info = routes._latest_cron_session_info_for_jobs(["a"], ["a"], deadline_s=5.0)
+    info = routes._latest_cron_session_info_for_jobs(["a", "b"], ["a"], deadline_s=5.0)
 
     scans = [sql for sql in seen if "FROM sessions" in sql]
     assert scans, "expected a sessions scan"
-    assert all("LIMIT 200" in sql for sql in scans)
-    # The newest row still wins: the cap must not cut the answer off.
-    assert info["a"]["session_id"] == "cron_a_004999"
+    assert not any("LIMIT" in sql for sql in scans), (
+        "the lookup must not cap the candidate window globally, or a requested "
+        "job behind newer rows from other jobs is silently dropped"
+    )
+    assert info["a"]["session_id"] == "cron_a_000001"
+    assert info["a"]["message_count"] == 7
+
+
+def test_lookup_fully_scanned_missing_session_is_empty(tmp_path, monkeypatch):
+    """A completed job with no persisted session is an empty result, not a failure.
+
+    The scan ran to completion and simply found nothing for the job, so the
+    caller must report success with an empty ``session_id`` - not a retryable
+    failure. This is the distinction the #7830 fix must preserve.
+    """
+    import api.profiles as profiles
+    import api.routes as routes
+
+    home = tmp_path / "home"
+    home.mkdir()
+    db = home / "state.db"
+    with sqlite3.connect(db) as conn:
+        conn.executescript(
+            "CREATE TABLE sessions ("
+            "id TEXT PRIMARY KEY, source TEXT, started_at REAL, message_count INTEGER);"
+        )
+        conn.executemany(
+            "INSERT INTO sessions VALUES (?, 'cron', ?, 1)",
+            [(f"cron_b_{i:06d}", float(i)) for i in range(50)],
+        )
+
+    monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", home)
+    monkeypatch.setattr(profiles, "_INITIAL_HERMES_HOME", home)
+
+    info = routes._latest_cron_session_info_for_jobs(["a", "b"], ["a"], deadline_s=5.0)
+
+    assert info["a"] == {"session_id": "", "message_count": None}
+
+
+def test_cron_recent_no_session_is_not_a_failed_lookup(tmp_path, monkeypatch):
+    """A fully scanned lookup with no session for the job reports success (#7830)."""
+    import api.profiles as profiles
+    import api.routes as routes
+
+    home = tmp_path / "home"
+    home.mkdir()
+    db = home / "state.db"
+    with sqlite3.connect(db) as conn:
+        conn.executescript(
+            "CREATE TABLE sessions ("
+            "id TEXT PRIMARY KEY, source TEXT, started_at REAL, message_count INTEGER);"
+        )
+        conn.executemany(
+            "INSERT INTO sessions VALUES (?, 'cron', ?, 1)",
+            [(f"cron_b_{i:06d}", float(i)) for i in range(50)],
+        )
+
+    monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", home)
+    monkeypatch.setattr(profiles, "_INITIAL_HERMES_HOME", home)
+    _stub_cron_jobs(monkeypatch, jobs=list(_ONE_JOB))
+
+    handler = _JSONHandler()
+    routes._handle_cron_recent(handler, SimpleNamespace(query="since=10"))
+
+    body = _payload(handler)
+    assert body["session_lookup_failed"] is False
+    assert body["completions"][0]["session_id"] == ""
+
+
+def test_lookup_restricts_read_to_requested_jobs_inside_deadline(tmp_path, monkeypatch):
+    """The read is an id range over the requested jobs, not a full-table scan.
+
+    A full scan and sort over a large state.db is what pushed the old lookup past
+    its deadline; after a bounded number of failed attempts the page dropped the
+    completion's unread marker. Restricting the query to the requested job ids
+    keeps the read inside the budget whatever the number of other jobs' sessions.
+    """
+    import api.profiles as profiles
+    import api.routes as routes
+
+    home = tmp_path / "home"
+    home.mkdir()
+    db = home / "state.db"
+    with sqlite3.connect(db) as conn:
+        conn.executescript(
+            "CREATE TABLE sessions ("
+            "id TEXT PRIMARY KEY, source TEXT, started_at REAL, message_count INTEGER);"
+        )
+        conn.executemany(
+            "INSERT INTO sessions VALUES (?, 'cron', ?, 1)",
+            [(f"cron_b_{i:06d}", float(1000 + i)) for i in range(200000)],
+        )
+        conn.execute("INSERT INTO sessions VALUES ('cron_a_000001', 'cron', 1.0, 7)")
+
+    monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", home)
+    monkeypatch.setattr(profiles, "_INITIAL_HERMES_HOME", home)
+
+    seen = []
+    real_open = routes.open_state_db_readonly
+
+    def _recording_open(db_path, *args, **kwargs):
+        conn = real_open(db_path, *args, **kwargs)
+        conn.set_trace_callback(seen.append)
+        return conn
+
+    monkeypatch.setattr(routes, "open_state_db_readonly", _recording_open)
+
+    info = routes._latest_cron_session_info_for_jobs(["a", "b"], ["a"], deadline_s=0.25)
+
+    scans = [sql for sql in seen if "FROM sessions" in sql]
+    assert scans, "expected a sessions scan"
+    assert any("s.id >=" in sql and "s.id <" in sql for sql in scans), (
+        "the read must be restricted to the requested job ids, or a large state.db "
+        "pushes it past the deadline and the page drops the completion"
+    )
+    assert info["a"]["session_id"] == "cron_a_000001"
+    assert info["a"]["message_count"] == 7
 
 
 _POLL_HARNESS_PREAMBLE = """
@@ -311,9 +434,12 @@ let _cronPollTimer=null;
 let _cronUnreadCount=0;
 let _cronPollGeneration=0;
 const _cronNewJobIds=new Set();
-const _CRON_PENDING_MAX=50;
-const _CRON_PENDING_ATTEMPTS=5;
+const _CRON_RETRY_BATCH=50;
+const _CRON_PENDING_BACKOFF_BASE_MS=30000;
+const _CRON_PENDING_BACKOFF_MAX_MS=1800000;
 const _cronPendingDetails=new Map();
+let fakeNow=1000000;
+Date.now=()=>fakeNow;
 const markCalls=[];
 const toastCalls=[];
 const urls=[];
@@ -334,18 +460,15 @@ function _markSessionCompletionUnreadIfBackground(sid,count){ markCalls.push([si
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
 def test_poll_advances_cursor_and_retries_detail_without_replaying_completion():
-    """A failed lookup advances the cursor; the retry neither re-badges nor re-toasts.
-
-    Guards the two round-3 findings: holding the cursor replayed completions so an
-    opened job's badge came back, and old toasts returned once the toast memory
-    evicted them.
-    """
+    """A failed lookup advances the cursor; the retry neither re-badges nor re-toasts."""
     polling = _extract_function(PANELS_JS, "startCronPolling")
     remember = _extract_function(PANELS_JS, "_cronRememberPendingDetails")
     retry = _extract_function(PANELS_JS, "_cronRetryPendingDetails")
+    backoff = _extract_function(PANELS_JS, "_cronPendingBackoffMs")
     script = (
         _POLL_HARNESS_PREAMBLE
         + f"""
+{backoff}
 {remember}
 {retry}
 {polling}
@@ -365,6 +488,7 @@ def test_poll_advances_cursor_and_retries_detail_without_replaying_completion():
   const afterFirst={{since:_cronPollSince,badge:Array.from(_cronNewJobIds),pending:_cronPendingDetails.size,toasts:toastCalls.length}};
   // The user opens the job, clearing its badge.
   _cronNewJobIds.delete('job-a');
+  fakeNow+=31000;  // let the backoff elapse so the retry fires again
   await intervalCallback();
   process.stdout.write(JSON.stringify({{
     afterFirst,
@@ -396,36 +520,32 @@ def test_poll_advances_cursor_and_retries_detail_without_replaying_completion():
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
-def test_poll_gives_up_on_a_permanently_failing_lookup():
-    """After a bounded number of attempts the page drops the pending completion."""
+def test_poll_backs_off_instead_of_discarding_a_failing_lookup():
+    """A permanently failing lookup stays pending and grows its retry delay."""
     polling = _extract_function(PANELS_JS, "startCronPolling")
     remember = _extract_function(PANELS_JS, "_cronRememberPendingDetails")
     retry = _extract_function(PANELS_JS, "_cronRetryPendingDetails")
+    backoff = _extract_function(PANELS_JS, "_cronPendingBackoffMs")
     script = (
         _POLL_HARNESS_PREAMBLE
         + f"""
+{backoff}
 {remember}
 {retry}
 {polling}
 (async()=>{{
-  responses=[
-    {{completions:[{{job_id:'job-a',completed_at:20,name:'A',status:'success',toast_notifications:true}}],session_lookup_failed:true}},
-    {{completions:[],session_lookup_failed:true}},
-  ];
-  global.api=async(url)=>{{
-    urls.push(url);
-    if(responses.length) return responses.shift();
-    return {{completions:[],session_lookup_failed:true}};
-  }};
+  responses=[{{completions:[{{job_id:'job-a',completed_at:20,name:'A',status:'success',toast_notifications:true}}],session_lookup_failed:true}}];
+  global.api=async(url)=>{{ urls.push(url); if(responses.length) return responses.shift(); return {{completions:[],session_lookup_failed:true}}; }};
   startCronPolling();
-  const sizes=[];
-  const toasts=[];
-  for(let i=0;i<6;i+=1){{
-    await intervalCallback();
-    sizes.push(_cronPendingDetails.size);
-    toasts.push(toastCalls.length);
-  }}
-  process.stdout.write(JSON.stringify({{sizes,toasts}}));
+  await intervalCallback();
+  const read=()=>{{ const e=[..._cronPendingDetails.values()][0]; return {{size:_cronPendingDetails.size,attempts:e.attempts,next:e.next_at}}; }};
+  const after1=read();
+  for(let i=0;i<4;i+=1) await intervalCallback();
+  const middle=read();
+  fakeNow+=31000;
+  await intervalCallback();
+  const afterBackoff=read();
+  process.stdout.write(JSON.stringify({{after1,middle,afterBackoff}}));
 }})().catch(error=>{{ console.error(error); process.exit(1); }});
 """
     )
@@ -434,8 +554,50 @@ def test_poll_gives_up_on_a_permanently_failing_lookup():
     )
     state = json.loads(result.stdout)
 
-    # One pending entry after the first poll; gone after _CRON_PENDING_ATTEMPTS.
-    assert state["sizes"][0] == 1
-    assert state["sizes"][-1] == 0
-    assert state["sizes"] == [1, 1, 1, 1, 0, 0]
-    assert state["toasts"] == [1, 1, 1, 1, 1, 1]
+    # Kept the whole time — never discarded after a fixed number of tries.
+    assert state["after1"]["size"] == 1
+    assert state["middle"]["size"] == 1
+    assert state["afterBackoff"]["size"] == 1
+    # The first retry fires; while backing off, no further attempts are made.
+    assert state["after1"]["attempts"] == 1
+    assert state["middle"]["attempts"] == 1
+    # After the 30 s backoff elapses, one more attempt, and the delay doubles.
+    assert state["afterBackoff"]["attempts"] == 2
+    assert state["afterBackoff"]["next"] == 1000000 + 31000 + 60000
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_poll_keeps_every_pending_completion_and_batches_the_retry():
+    """51 failed enrichments are all kept; one retry request covers only the batch."""
+    polling = _extract_function(PANELS_JS, "startCronPolling")
+    remember = _extract_function(PANELS_JS, "_cronRememberPendingDetails")
+    retry = _extract_function(PANELS_JS, "_cronRetryPendingDetails")
+    backoff = _extract_function(PANELS_JS, "_cronPendingBackoffMs")
+    script = (
+        _POLL_HARNESS_PREAMBLE
+        + f"""
+{backoff}
+{remember}
+{retry}
+{polling}
+(async()=>{{
+  const comps=[];
+  for(let i=0;i<51;i+=1) comps.push({{job_id:'job-'+i,completed_at:1000+i,name:'J'+i,status:'success',toast_notifications:false}});
+  responses=[{{completions:comps,session_lookup_failed:true}}];
+  global.api=async(url)=>{{ urls.push(url); if(responses.length) return responses.shift(); return {{completions:[],session_lookup_failed:true}}; }};
+  startCronPolling();
+  await intervalCallback();
+  let attempted=0, untouched=0;
+  for(const e of _cronPendingDetails.values()){{ if(e.attempts>0) attempted+=1; else untouched+=1; }}
+  process.stdout.write(JSON.stringify({{size:_cronPendingDetails.size,attempted,untouched}}));
+}})().catch(error=>{{ console.error(error); process.exit(1); }});
+"""
+    )
+    result = subprocess.run(
+        [NODE, "-e", script], check=True, capture_output=True, text=True, timeout=30
+    )
+    state = json.loads(result.stdout)
+
+    assert state["size"] == 51         # nothing evicted past the old 50-entry cap
+    assert state["attempted"] == 50    # one retry request covered only the batch
+    assert state["untouched"] == 1     # the newest entry waits for the next batch
